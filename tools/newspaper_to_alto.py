@@ -28,6 +28,8 @@ import sys
 import time
 from pathlib import Path
 
+import requests
+
 # PaddlePaddle disables oneDNN via this env var, which must be set before
 # any Paddlepaddle module is imported.  PaddleOCR / PaddleX import paddlepaddle
 # internally, so we must do this before any other import that might trigger it.
