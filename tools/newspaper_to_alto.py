@@ -1,174 +1,205 @@
 #!/usr/bin/env python3
 """
-Generate ALTO XML from a single newspaper page.
+Generate ALTO XML from a single newspaper page (or batch of pages).
 
 Usage
 -----
-    # Single image (local file or URL as positional arg)
-    python tools/newspaper_to_alto.py page_01.jpg
-    python tools/newspaper_to_alto.py https://example.com/page.jpg
-    python tools/newspaper_to_alto.py page.jpg -o output/alto.xml
+    # Single image from URL
+    python tools/newspaper_to_alto.py \
+        https://digi.bib.uni-mannheim.de/periodika/fileadmin/data/DeutReunP_856399094_18920102/default/856399094_1892_001_01.jpg
 
-    # Batch: all supported images in a directory
-    python tools/newspaper_to_alto.py /path/to/pages/
+    # Single image (local file), custom output
+    python tools/newspaper_to_alto.py page.jpg -o page.alto.xml
+
+    # Multiple images
+    python tools/newspaper_to_alto.py *.jpg -o output/
+
+    # Directory of images
+    python tools/newspaper_to_alto.py /path/to/scans/ -o output/
 """
 
 from __future__ import annotations
 
 import argparse
-import logging
 import os
 import sys
 import time
 from pathlib import Path
 
-# Allow running as `python tools/newspaper_to_alto.py` (from repo root)
-# and as `python tools/newspaper_to_alto.py` (from anywhere).
-__dir__ = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, __dir__)
-sys.path.insert(0, os.path.abspath(os.path.join(__dir__, "..")))
+# PaddlePaddle disables oneDNN via this env var, which must be set before
+# any Paddlepaddle module is imported.  PaddleOCR / PaddleX import paddlepaddle
+# internally, so we must do this before any other import that might trigger it.
+try:
+    import os as _os  # noqa: F401
+except ImportError:
+    pass
 
-_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+if "PADDLE_USE_DNNL" not in os.environ:
+    os.environ["PADDLE_USE_DNNL"] = "0"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)s  %(message)s",
-)
-log = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-
-def _collect_images(path: Path) -> list[Path]:
-    """Return list of image file paths under *path* (file or directory)."""
-    if path.is_file():
-        return [path]
-    if path.is_dir():
-        imgs = sorted(
-            p for e in _IMAGE_EXTS
-            for p in path.rglob(f"*{e}")
-        )
-        if not imgs:
-            log.warning("No images found in %s", path)
-        return list(imgs)
-    return []
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 
-def _download_image(url: str, dest: Path) -> Path:
-    """Download *url* to *dest*."""
-    import requests
-    if dest.exists():
-        log.info("Already exists: %s", dest)
-        return dest
+# ---------------------------------------------------------------------------
+# Download helpers
+# ---------------------------------------------------------------------------
+
+def _download(url: str, dest: Path) -> str:
+    """Download ``url`` to ``dest``. Returns the destination path."""
     dest.parent.mkdir(parents=True, exist_ok=True)
-    log.info("Downloading %s", url)
     resp = requests.get(url, timeout=120, stream=True)
     resp.raise_for_status()
     with open(dest, "wb") as fh:
-        for chunk in resp.iter_content(chunk_size=8192):
+        for chunk in resp.iter_content(8192):
             fh.write(chunk)
-    return dest
+    return str(dest)
 
 
-def _download_one(url: str, output_dir: Path) -> Path:
-    """Download a single image, returning the destination path."""
-    stem = Path(url).stem
-    dest = output_dir / f"{stem}.jpg"
-    return _download_image(url, dest)
+def _collect_images(path: Path) -> list[Path]:
+    """Return image files under ``path`` (file or directory)."""
+    if path.is_file():
+        return [path]
+    if path.is_dir():
+        imgs = [p for e in IMAGE_EXTS for p in path.rglob(f"*{e}")]
+        return sorted(imgs)
+    return []
 
 
-def _run_alto(image_path: Path, output_path: Path, **kwargs) -> Path:
-    """Run PP-StructureV3 OCR and convert to ALTO XML."""
+# ---------------------------------------------------------------------------
+# Pipeline: download -> OCR -> convert
+# ---------------------------------------------------------------------------
+
+def _run_ocr_alto(image_path: str, output_path: str, **opts) -> None:
+    """Run PP-StructureV3 (layout-aware OCR) then convert result to ALTO XML."""
     from paddleocr import PPStructureV3
 
-    log.info("Initialising PP-StructureV3 (device=%s, lang=%s)",
-             kwargs.get("device", "auto"), kwargs.get("lang", "de"))
+    print(f"[OCR]    processing  {image_path}", flush=True)
 
-    v3 = PPStructureV3(**kwargs)
+    # PP-StructureV3 provides layout detection + text line recognition,
+    # which is essential for multi-column newspaper pages.
+    v3 = PPStructureV3(**opts)
 
-    log.info("Running OCR on %s", image_path)
-    t0 = time.monotonic()
-    result = v3.predict(str(image_path))
-    elapsed = time.monotonic() - t0
-    log.info("OCR finished in %.1f s  (%d page(s))", elapsed, len(result))
+    t0 = time.time()
+    result = v3.predict(image_path)
+    elapsed = time.time() - t0
 
-    from paddleocr_alto import convert_to_alto
+    # ``result`` is a list of pages; take the first one.
+    page = result[0] if isinstance(result, list) else result
 
-    region = result[0]
-    regions = region.get("overall_layout_res", None)
+    print(f"[OCR]    done      {image_path:>40s}  {elapsed:6.1f}s", flush=True)
 
-    xml = convert_to_alto(region, image_path=str(image_path), regions=regions)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(xml, encoding="utf-8")
+    # Extract region info for layout-aware ALTO generation.
+    regions = page.get("overall_layout_res", None)
+
+    xml = convert_to_alto(page, image_path=image_path, regions=regions)
+
+    # Determine output file path
+    out = Path(output_path)
+    if out.is_dir():
+        out = out / f"{Path(image_path).stem}.alto.xml"
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(xml, encoding="utf-8")
+
+    print(f"[ALTO]  written   {out}", flush=True)
 
     v3.close()
-    log.info("Output: %s", output_path)
-    return output_path
 
 
-def _cli() -> None:
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Convert newspaper pages (JPEG/PNG) to ALTO XML",
+        description="Newspaper images --> ALTO XML via PaddleOCR",
     )
 
-    # --- positional: one or more image paths / dirs / URLs ---
+    # --- positional: one or more image paths / directories / URLs ---
     ap.add_argument(
         "images", nargs="+",
         help="Image file(s), directory, or URL(s)",
     )
 
-    # --- options ---
+    # --- output ---
     ap.add_argument(
-        "--output", "-o", type=Path, default=Path("output"),
-        help="Output directory or file path (default: output)",
-    )
-    ap.add_argument(
-        "--download-only", action="store_true",
-        help="Only download images, skip OCR",
+        "-o", "--output", type=Path, default=Path("output"),
+        help="Output directory or ALTO file path  (default: output/)",
     )
 
-    # --- OCR tunables (defaults tuned for historical German newspapers) ---
-    ap.add_argument("--lang", default="de")
-    ap.add_argument("--ocr-version", default="PP-OCRv5")
-    ap.add_argument("--det-thresh", type=float, default=0.2)
-    ap.add_argument("--det-box-thresh", type=float, default=0.3)
-    ap.add_argument("--det-unclip-ratio", type=float, default=2.5)
-    ap.add_argument("--det-limit-side", type=int, default=1600)
-    ap.add_argument("--det-limit-type", default="max")
-    ap.add_argument("--device", default="cpu", help="Device: cpu, gpu, xpu, npu, or ipu")
+    # --- detection tunables (defaults tuned for historical German newspapers) ---
+    ap.add_argument("--det-thresh", type=float, default=0.2,
+                    help="Detection threshold (lower = more boxes)  (default: 0.2)")
+    ap.add_argument("--det-box-thresh", type=float, default=0.3,
+                    help="Box confidence threshold (lower = more boxes)  (default: 0.3)")
+    ap.add_argument("--det-unclip-ratio", type=float, default=2.5,
+                    help="Unclip ratio for box expansion  (default: 2.5)")
+    ap.add_argument("--det-limit-side", type=int, default=1600,
+                    help="Max image side length for detection  (default: 1600)")
+    ap.add_argument("--det-limit-type", default="max",
+                    help="Limit strategy: min, max, etc.  (default: max)")
+
+    # --- language / model ---
+    ap.add_argument("--lang", default="de", help="Recognition language  (default: de)")
+    ap.add_argument("--version", default="PP-OCRv5",
+                    help="PaddleOCR model version  (default: PP-OCRv5)")
+    ap.add_argument(
+        "--device", default="auto",
+        choices=["auto", "cpu", "gpu", "xpu", "npu", "ipu", "hybrinx"],
+        help="Target device  (default: auto)",
+    )
 
     args = ap.parse_args()
 
-    # --- build OCR kwargs ---
-    ocr_kwargs = {
+    # ---------- collect targets ----------
+    targets: list[str] = []
+
+    for arg in args.images:
+        p = Path(arg)
+        if p.exists():
+            targets.extend(str(img) for img in _collect_images(p))
+        elif arg.startswith("http://") or arg.startswith("https://"):
+            # Download to output directory first
+            stem = Path(arg).stem
+            dest = args.output / f"{stem}.jpg"
+            _download(arg, dest)
+            targets.append(str(dest))
+        else:
+            print(f"[WARN] skipping  {arg}  (not found or not a URL)", file=sys.stderr)
+
+    if not targets:
+        ap.error("no images found")
+
+    # ---------- build OCR options ----------
+    opts: dict[str, Any] = {
         "lang": args.lang,
-        "ocr_version": args.ocr_version,
+        "use_darkmode_cfg": True,
+        "show_log": False,
+        "det": True,
+        "rec": True,
+        # Detection params passed through kwargs to PaddleOCR
         "text_det_thresh": args.det_thresh,
         "text_det_box_thresh": args.det_box_thresh,
         "text_det_unclip_ratio": args.det_unclip_ratio,
         "text_det_limit_side_len": args.det_limit_side,
         "text_det_limit_type": args.det_limit_type,
+        "use_gpu": args.device == "auto" or args.device == "gpu",
         "device": args.device,
     }
 
-    output_dir = args.output
+    print(f"[INFO] {len(targets)} image(s) to process  |  device={opts['device']}", flush=True)
 
-    # --- collect targets ---
-    targets: list[tuple[Path, bool]] = []  # (image_path, is_url)
+    # ---------- process ----------
+    for img in targets:
+        out = args.output / f"{Path(img).stem}.alto.xml"
+        _run_ocr_alto(img, str(out), **opts)
 
-    for arg in args.images:
-        p = Path(arg)
-        if arg.startswith("http://") or arg.startswith("https://"):
-            # URL: download to output_dir
-            targets.append((_download_one(arg, output_dir), False))
-        elif p.exists():
-            targets.extend((img, False) for img in _collect_images(p))
-
-    # --- download first, then process ---
-    if not args.download_only:
-        for img_path, _is_url in targets:
-            _run_alto(img_path, output_dir, **ocr_kwargs)
-    else:
-        log.info("Download-only mode; images already downloaded.")
+    print("[INFO] all done.", flush=True)
 
 
 if __name__ == "__main__":
-    _cli()
+    main()
