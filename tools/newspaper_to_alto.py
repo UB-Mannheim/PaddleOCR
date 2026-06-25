@@ -1,41 +1,34 @@
 #!/usr/bin/env python3
-
 """
-Generate ALTO XML from a historic German newspaper page.
+Generate ALTO XML from a single newspaper page.
 
 Usage
 -----
-    # Single page
-    python tools/newspaper_to_alto.py -u \
-        https://digi.bib.uni-mannheim.de/periodika/fileadmin/data/DeutReunP_856399094_18920102/default/856399094_1892_001_01.jpg \
-        -o output/alto.xml
+    # Single image (local file or URL as positional arg)
+    python tools/newspaper_to_alto.py page_01.jpg
+    python tools/newspaper_to_alto.py https://example.com/page.jpg
+    python tools/newspaper_to_alto.py page.jpg -o output/alto.xml
 
-    # Download + page range (multiple pages, skip ALTO conversion)
-    # --download-only produces JPEGs only; use --alto to also generate ALTO
-    python tools/newspaper_to_alto.py \
-        https://digi.bib.uni-mannheim.de/periodika/fileadmin/data/DeutReunP_856399094_18920102/default/\
-856399094_1892_001_{:02d}.jpg \
-        -o output/page --download-only
-
-    # Batch: download JPEGs and run full OCR pipeline
-        python tools/newspaper_to_alto.py \
-        https://digi.bib.uni-mannheim.de/periodika/fileadmin/data/DeutReunP_856399094_18920102/default/\
-856399094_1892_001_{:02d}.jpg \
-        -o output/page --download-only --download-start 1 --download-end 5
+    # Batch: all supported images in a directory
+    python tools/newspaper_to_alto.py /path/to/pages/
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
+import sys
 import time
 from pathlib import Path
-from typing import Optional
 
-import numpy as np
-import requests
+# Allow running as `python tools/newspaper_to_alto.py` (from repo root)
+# and as `python tools/newspaper_to_alto.py` (from anywhere).
+__dir__ = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, __dir__)
+sys.path.insert(0, os.path.abspath(os.path.join(__dir__, "..")))
 
-from tools.paddleocr_alto import convert_to_alto
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,107 +37,52 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def _collect_images(path: Path) -> list[Path]:
+    """Return list of image file paths under *path* (file or directory)."""
+    if path.is_file():
+        return [path]
+    if path.is_dir():
+        imgs = sorted(
+            p for e in _IMAGE_EXTS
+            for p in path.rglob(f"*{e}")
+        )
+        if not imgs:
+            log.warning("No images found in %s", path)
+        return list(imgs)
+    return []
 
-def download_image(url: str, dest: Path) -> Path:
-    """Download *url* to *dest* (single file) and return *dest*."""
+
+def _download_image(url: str, dest: Path) -> Path:
+    """Download *url* to *dest*."""
+    import requests
     if dest.exists():
         log.info("Already exists: %s", dest)
         return dest
-
     dest.parent.mkdir(parents=True, exist_ok=True)
     log.info("Downloading %s", url)
     resp = requests.get(url, timeout=120, stream=True)
     resp.raise_for_status()
-
-    with open(dest, "wb") as fh:  # noqa: SIM115
+    with open(dest, "wb") as fh:
         for chunk in resp.iter_content(chunk_size=8192):
             fh.write(chunk)
     return dest
 
 
-def download_sequence(
-    url_template: str,
-    output_dir: Path,
-    start: int,
-    end: int,
-) -> list[Path]:
-    """Download pages `{start}..{end}` from a templated URL.
-
-    The URL template must contain a ``{:02d}`` placeholder for the page
-    number (adjust if your site uses a different format).
-    """
-    pages: list[Path] = []
-    for n in range(start, end + 1):
-        url = url_template.format(n)
-        dest = output_dir / f"page_{n:02d}.jpg"
-        pages.append(download_image(url, dest))
-    return pages
+def _download_one(url: str, output_dir: Path) -> Path:
+    """Download a single image, returning the destination path."""
+    stem = Path(url).stem
+    dest = output_dir / f"{stem}.jpg"
+    return _download_image(url, dest)
 
 
-# ---------------------------------------------------------------------------
-# ALTO conversion wrapper
-# ---------------------------------------------------------------------------
+def _run_alto(image_path: Path, output_path: Path, **kwargs) -> Path:
+    """Run PP-StructureV3 OCR and convert to ALTO XML."""
+    from paddleocr import PPStructureV3
 
-def convert_to_alto_file(
-    ocr_result: dict | list | np.ndarray,
-    image_path: Path,
-    output_path: Path,
-    regions: Optional[list[dict]] = None,
-) -> None:
-    """Run ALTO conversion and write to *output_path*."""
-    xml = convert_to_alto(
-        ocr_result,
-        image_path=str(image_path),
-        regions=regions,
-    )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(xml, encoding="utf-8")
+    log.info("Initialising PP-StructureV3 (device=%s, lang=%s)",
+             kwargs.get("device", "auto"), kwargs.get("lang", "de"))
 
-
-# ---------------------------------------------------------------------------
-# Main pipeline
-# ---------------------------------------------------------------------------
-
-def run_alto_pipeline(
-    image_path: Path,
-    output_path: Path,
-    lang: str = "de",
-    ocr_version: str = "PP-OCRv5",
-    text_det_thresh: float = 0.2,
-    text_det_box_thresh: float = 0.3,
-    text_det_unclip_ratio: float = 2.5,
-    text_det_limit_side_len: int = 1600,
-    text_det_limit_type: str = "max",
-    use_doc_unwarping: bool = True,
-    use_textline_orientation: bool = True,
-    format_block_content: bool = False,
-    **kwargs,
-) -> Path:
-    """Run PP-Structur eV3 OCR and produce an ALTO XML file.
-
-    Returns the path to the generated ALTO XML.
-    """
-    from paddleocr import PPStructureV3  # noqa: E402
-
-    log.info("Initialising PP-StructureV3 pipeline (lang=%s, version=%s, device=%s)",
-             lang, ocr_version, kwargs.get("device", "auto"))
-
-    v3 = PPStructureV3(
-        lang=lang,
-        ocr_version=ocr_version,
-        text_det_thresh=text_det_thresh,
-        text_det_box_thresh=text_det_box_thresh,
-        text_det_unclip_ratio=text_det_unclip_ratio,
-        text_det_limit_side_len=text_det_limit_side_len,
-        text_det_limit_type=text_det_limit_type,
-        use_doc_unwarping=use_doc_unwarping,
-        use_textline_orientation=use_textline_orientation,
-        format_block_content=format_block_content,
-        **kwargs,
-    )
+    v3 = PPStructureV3(**kwargs)
 
     log.info("Running OCR on %s", image_path)
     t0 = time.monotonic()
@@ -152,124 +90,84 @@ def run_alto_pipeline(
     elapsed = time.monotonic() - t0
     log.info("OCR finished in %.1f s  (%d page(s))", elapsed, len(result))
 
-    # Convert first page to ALTO
-    region = result[0]
-    # PP-StructureV3 returns a dict with an "overall_ocr_res" key that
-    # contains the classic OCR dict, plus layout information in the outer dict.
-    # Some results also have an "overall_layout_res" key with region info.
+    from paddleocr_alto import convert_to_alto
 
+    region = result[0]
     regions = region.get("overall_layout_res", None)
 
-    log.info("Converting to ALTO XML: %s", output_path)
-    convert_to_alto_file(region, image_path, output_path, regions=regions)
+    xml = convert_to_alto(region, image_path=str(image_path), regions=regions)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(xml, encoding="utf-8")
 
     v3.close()
-    log.info("Done.")
+    log.info("Output: %s", output_path)
     return output_path
 
 
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
-
 def _cli() -> None:
     ap = argparse.ArgumentParser(
-        description="Convert a German newspaper page (JPEG) to ALTO XML",
-    )
-    # Single-page mode
-    ap.add_argument(
-        "--image", "-i", type=Path,
-        help="Path to a single JPEG image file (use either this or -u)",
-    )
-    ap.add_argument(
-        "--url", "-u", type=str,
-        help="URL of a single JPEG image (will download to --output)",
-    )
-    # Batch mode
-    ap.add_argument(
-        "--download-start", type=int, default=1,
-        help="Start page number for batch download (default: 1)",
-    )
-    ap.add_argument(
-        "--download-end", type=int, default=1,
-        help="End page number for batch download (default: 1)",
-    )
-    # Output
-    ap.add_argument(
-        "--output", "-o", type=Path, default=Path("output"),
-        help="Output directory or ALTO file path (default: output)",
-    )
-    # Optional
-    ap.add_argument(
-        "--download-only", action="store_true",
-        help="Only download JPEGs, skip OCR / ALTO conversion",
+        description="Convert newspaper pages (JPEG/PNG) to ALTO XML",
     )
 
-    # OCR tunables (defaults tuned for historical German newspapers)
-    ap.add_argument("--lang", default="de", help="Recognition language (default: de)")
-    ap.add_argument("--ocr-version", default="PP-OCRv5", help="OCR model version (default: PP-OCRv5)")
-    ap.add_argument("--det-thresh", default=0.2, type=float, help="Detection threshold (default: 0.2)")
-    ap.add_argument("--det-box-thresh", default=0.3, type=float, help="Box threshold (default: 0.3)")
-    ap.add_argument("--det-unclip-ratio", default=2.5, type=float, help="Unclip ratio (default: 2.5)")
-    ap.add_argument("--det-limit-side", default=1600, type=int, help="Detection max side length (default: 1600)")
-    ap.add_argument("--det-limit-type", default="max", help="Detection limit strategy (default: max)")
+    # --- positional: one or more image paths / dirs / URLs ---
+    ap.add_argument(
+        "images", nargs="+",
+        help="Image file(s), directory, or URL(s)",
+    )
+
+    # --- options ---
+    ap.add_argument(
+        "--output", "-o", type=Path, default=Path("output"),
+        help="Output directory or file path (default: output)",
+    )
+    ap.add_argument(
+        "--download-only", action="store_true",
+        help="Only download images, skip OCR",
+    )
+
+    # --- OCR tunables (defaults tuned for historical German newspapers) ---
+    ap.add_argument("--lang", default="de")
+    ap.add_argument("--ocr-version", default="PP-OCRv5")
+    ap.add_argument("--det-thresh", type=float, default=0.2)
+    ap.add_argument("--det-box-thresh", type=float, default=0.3)
+    ap.add_argument("--det-unclip-ratio", type=float, default=2.5)
+    ap.add_argument("--det-limit-side", type=int, default=1600)
+    ap.add_argument("--det-limit-type", default="max")
+    ap.add_argument("--device", default="auto", help="cpu, gpu, or auto")
 
     args = ap.parse_args()
 
-    if args.image:
-        # Single file mode -- OCR + ALTO
-        if not args.download_only:
-            run_alto_pipeline(
-                image_path=args.image,
-                output_path=args.output,
-                lang=args.lang,
-                ocr_version=args.ocr_version,
-                text_det_thresh=args.det_thresh,
-                text_det_box_thresh=args.det_box_thresh,
-                text_det_unclip_ratio=args.det_unclip_ratio,
-                text_det_limit_side_len=args.det_limit_side,
-                text_det_limit_type=args.det_limit_type,
-                device=kwargs.pop("device", "auto"),  # noqa: F821
-            )
-        else:
-            log.info("Download-only mode; nothing to do for a local file.")
+    # --- build OCR kwargs ---
+    ocr_kwargs = {
+        "lang": args.lang,
+        "ocr_version": args.ocr_version,
+        "text_det_thresh": args.det_thresh,
+        "text_det_box_thresh": args.det_box_thresh,
+        "text_det_unclip_ratio": args.det_unclip_ratio,
+        "text_det_limit_side_len": args.det_limit_side,
+        "text_det_limit_type": args.det_limit_type,
+        "device": args.device,
+    }
 
-    elif args.url:
-        # Single URL mode
-        if args.download_only:
-            # Resolve filename from URL stem
-            stem = Path(args.url).stem
-            out_file = args.output / f"{stem}.jpg"
-            download_image(args.url, out_file)
-        else:
-            # Download, OCR, convert
-            stem = Path(args.url).stem
-            image_file = args.output / f"{stem}.jpg"
-            download_image(args.url, image_file)
-            run_alto_pipeline(
-                image_path=image_file,
-                output_path=args.output if args.output.is_dir() else args.output.parent / f"{stem}.xml",
-                lang=args.lang,
-                ocr_version=args.ocr_version,
-                text_det_thresh=args.det_thresh,
-                text_det_box_thresh=args.det_box_thresh,
-                text_det_unclip_ratio=args.det_unclip_ratio,
-                text_det_limit_side_len=args.det_limit_side,
-                text_det_limit_type=args.det_limit_type,
-            )
+    output_dir = args.output
 
+    # --- collect targets ---
+    targets: list[tuple[Path, bool]] = []  # (image_path, is_url)
+
+    for arg in args.images:
+        p = Path(arg)
+        if arg.startswith("http://") or arg.startswith("https://"):
+            # URL: download to output_dir
+            targets.append((_download_one(arg, output_dir), False))
+        elif p.exists():
+            targets.extend((img, False) for img in _collect_images(p))
+
+    # --- download first, then process ---
+    if not args.download_only:
+        for img_path, _is_url in targets:
+            _run_alto(img_path, output_dir, **ocr_kwargs)
     else:
-        # No image or URL provided; try batch download
-        output_dir = args.output
-        if not output_dir.exists():
-            output_dir.mkdir(parents=True)
-
-        # Build URL template from the first URL (need to parse manually)
-        # Since --url expects a single URL, for batch mode we expect the user
-        # to provide a URL with a {:02d} placeholder.
-        # Re-parse to allow --url to be used in batch mode.
-        # (This is handled by the caller -- we just warn here.)
-        log.error("Batch mode requires a --url with a {:02d} placeholder.")
+        log.info("Download-only mode; images already downloaded.")
 
 
 if __name__ == "__main__":
