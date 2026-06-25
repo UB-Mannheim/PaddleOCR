@@ -2,11 +2,13 @@
 """
 Generate ALTO XML from a single newspaper page (or batch of pages).
 
+Uses PP-StructureV3 which provides layout detection, multi-column
+reading-order recovery, table recognition and text line extraction.
+
 Usage
 -----
     # Single image from URL
-    python tools/newspaper_to_alto.py \
-        https://digi.bib.uni-mannheim.de/periodika/fileadmin/data/DeutReunP_856399094_18920102/default/856399094_1892_001_01.jpg
+    python tools/newspaper_to_alto.py https://example.com/page.jpg
 
     # Single image (local file), custom output
     python tools/newspaper_to_alto.py page.jpg -o page.alto.xml
@@ -29,13 +31,15 @@ from pathlib import Path
 # PaddlePaddle disables oneDNN via this env var, which must be set before
 # any Paddlepaddle module is imported.  PaddleOCR / PaddleX import paddlepaddle
 # internally, so we must do this before any other import that might trigger it.
-try:
-    import os as _os  # noqa: F401
-except ImportError:
-    pass
-
 if "PADDLE_USE_DNNL" not in os.environ:
     os.environ["PADDLE_USE_DNNL"] = "0"
+
+# Ensure the tool directory and the project root are in sys.path so that
+# sibling imports (e.g. ``from paddleocr_alto import ...``) work regardless
+# of the working directory.
+__dir__ = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, __dir__)                          # for paddleocr_alto.py
+sys.path.insert(0, os.path.abspath(os.path.join(__dir__, os.pardir)))  # for tools/paddleocr_alto
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -70,12 +74,13 @@ def _collect_images(path: Path) -> list[Path]:
 
 
 # ---------------------------------------------------------------------------
-# Pipeline: download -> OCR -> convert
+# Pipeline: download ->  convert
 # ---------------------------------------------------------------------------
 
 def _run_ocr_alto(image_path: str, output_path: str, **opts) -> None:
     """Run PP-StructureV3 (layout-aware OCR) then convert result to ALTO XML."""
     from paddleocr import PPStructureV3
+    from paddleocr_alto import convert_to_alto
 
     print(f"[OCR]    processing  {image_path}", flush=True)
 
@@ -147,11 +152,6 @@ def main() -> None:
     ap.add_argument("--lang", default="de", help="Recognition language  (default: de)")
     ap.add_argument("--version", default="PP-OCRv5",
                     help="PaddleOCR model version  (default: PP-OCRv5)")
-    ap.add_argument(
-        "--device", default="auto",
-        choices=["auto", "cpu", "gpu", "xpu", "npu", "ipu", "hybrinx"],
-        help="Target device  (default: auto)",
-    )
 
     args = ap.parse_args()
 
@@ -174,24 +174,17 @@ def main() -> None:
     if not targets:
         ap.error("no images found")
 
-    # ---------- build OCR options ----------
-    opts: dict[str, Any] = {
+    # ---------- build PP-StructureV3 options ----------
+    # These are the actual __init__ arguments accepted by PPStructureV3.
+    opts = {
         "lang": args.lang,
-        "use_darkmode_cfg": True,
-        "show_log": False,
-        "det": True,
-        "rec": True,
-        # Detection params passed through kwargs to PaddleOCR
+        "ocr_version": args.version,
         "text_det_thresh": args.det_thresh,
         "text_det_box_thresh": args.det_box_thresh,
         "text_det_unclip_ratio": args.det_unclip_ratio,
         "text_det_limit_side_len": args.det_limit_side,
         "text_det_limit_type": args.det_limit_type,
-        "use_gpu": args.device == "auto" or args.device == "gpu",
-        "device": args.device,
     }
-
-    print(f"[INFO] {len(targets)} image(s) to process  |  device={opts['device']}", flush=True)
 
     # ---------- process ----------
     for img in targets:
