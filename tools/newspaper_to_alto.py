@@ -133,7 +133,7 @@ def _cli() -> None:
     ap.add_argument("--det-unclip-ratio", type=float, default=2.5)
     ap.add_argument("--det-limit-side", type=int, default=1600)
     ap.add_argument("--det-limit-type", default="max")
-    ap.add_argument("--device", default="auto", help="cpu, gpu, or auto")
+    ap.add_argument("--device", default="cpu", help="Device: cpu, gpu, xpu, npu, or ipu")
 
     args = ap.parse_args()
 
